@@ -56,6 +56,145 @@ def _encrypt_password(password: str) -> str:
     return base64.b64encode(encrypted).decode("utf-8")
 
 
+def _normalize_key(key: str) -> str:
+    """Normalize a JSON key for tolerant matching (sAID == saId == sa_id)."""
+    return "".join(ch for ch in key.lower() if ch.isalnum())
+
+
+def _ci_get(data: Any, *names: str) -> Any:
+    """Case/format-insensitive dict lookup."""
+    if not isinstance(data, dict):
+        return None
+    wanted = {_normalize_key(n) for n in names}
+    for key, value in data.items():
+        if _normalize_key(str(key)) in wanted:
+            return value
+    return None
+
+
+def _as_list(value: Any) -> list:
+    """Coerce to list — CCB endpoints return a bare dict for 1-item collections."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def _sa_is_active(sa_end: str) -> bool:
+    """Whether an SA end date means "still active".
+
+    Active agreements show up with an empty end date on most accounts, but
+    some (e.g. solar / TOU plans) carry a far-future placeholder instead.
+    """
+    text = str(sa_end or "").strip()
+    if not text:
+        return True
+    if "9999" in text:
+        return True
+    for candidate in (text, text[:10]):
+        for fmt in ("%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(candidate, fmt) > datetime.now()
+            except ValueError:
+                continue
+    return False
+
+
+def _describe_structure(node: Any, depth: int = 0) -> Any:
+    """Key structure of a JSON payload without any values (safe to log)."""
+    if depth > 8:
+        return "..."
+    if isinstance(node, dict):
+        return {k: _describe_structure(v, depth + 1) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_describe_structure(node[0], depth + 1)] if node else []
+    return type(node).__name__
+
+
+def _extract_sasp_candidates(details: dict) -> list[dict]:
+    """Find every SASP (service agreement / service point) in GetAllUserDetails.
+
+    Tries the documented path first, tolerating dict-vs-list and key-casing
+    quirks; if that yields nothing, recursively scans the whole payload for
+    any object carrying an sAID.
+    """
+    candidates: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(sasp: Any, premise: Any = None) -> None:
+        if not isinstance(sasp, dict):
+            return
+        sa_id = _ci_get(sasp, "sAID")
+        if sa_id in (None, ""):
+            return
+        entry = {
+            "sa_id": str(sa_id),
+            "sp_id": str(_ci_get(sasp, "sPID") or ""),
+            "premise_id": str(
+                _ci_get(sasp, "premiseID") or _ci_get(premise, "premiseID") or ""
+            ),
+            "premise_address": str(
+                _ci_get(sasp, "premiseAddress")
+                or _ci_get(premise, "premiseAddress")
+                or ""
+            ),
+            "sa_end": str(_ci_get(sasp, "sAEndDate") or ""),
+            "sa_type": str(
+                _ci_get(sasp, "sAType", "sATypeCd", "sATypeDesc", "sATypeDescription")
+                or ""
+            ),
+        }
+        key = (entry["sa_id"], entry["sp_id"])
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(entry)
+
+    acct_res = _ci_get(
+        _ci_get(_ci_get(details, "AccountDetails"), "getAccountDetailsResponse"),
+        "getAccountDetailsRes",
+    )
+    premise_list = _as_list(
+        _ci_get(_ci_get(acct_res, "getSASPListByAccountID"), "premiseDetailsList")
+    )
+    for premise in premise_list:
+        for sasp in _as_list(_ci_get(premise, "sASPDetails")):
+            add(sasp, premise)
+
+    if candidates:
+        return candidates
+
+    # Fallback: some account types nest SASP data differently — scan everything.
+    def walk(node: Any, premise: Any = None) -> None:
+        if isinstance(node, dict):
+            if _ci_get(node, "sAID") not in (None, ""):
+                add(node, premise)
+            nearest = node if _ci_get(node, "premiseID") not in (None, "") else premise
+            for value in node.values():
+                walk(value, nearest)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, premise)
+
+    walk(details)
+    return candidates
+
+
+def _choose_sasp(candidates: list[dict]) -> dict | None:
+    """Pick the best SASP: active first, then non-solar, then having an SP ID.
+
+    Solar accounts can carry a generation SA alongside the consumption one;
+    usage data lives on the consumption (non-solar) agreement.
+    """
+    if not candidates:
+        return None
+    pool = [c for c in candidates if _sa_is_active(c["sa_end"])] or candidates
+    non_solar = [c for c in pool if "SOLAR" not in c["sa_type"].upper()] or pool
+    with_sp = [c for c in non_solar if c["sp_id"]] or non_solar
+    return with_sp[0]
+
+
 class APSAuthError(Exception):
     """Raised when APS authentication fails."""
 
@@ -315,51 +454,36 @@ class APSUsageAPI:
         self._account_id = profile.get("AccountID")
         self._email = profile.get("emailAddress", "")
 
-        # Extract active SASP from getSASPListByAccountID
-        # Active = sAEndDate is empty (open-ended service agreement)
-        acct_res = (
-            details.get("AccountDetails", {})
-            .get("getAccountDetailsResponse", {})
-            .get("getAccountDetailsRes", {})
-        )
-        premise_list = acct_res.get("getSASPListByAccountID", {}).get(
-            "premiseDetailsList", []
-        )
-
+        # Extract the active SASP (service agreement / service point).
         self._sa_id = None
         self._sp_id = None
         self._premise_id = None
         self._premise_address = None
 
-        for premise in premise_list:
-            for sasp in premise.get("sASPDetails", []):
-                sa_end = sasp.get("sAEndDate", "")
-                if not sa_end:  # Empty end date = currently active
-                    self._sa_id = sasp.get("sAID")
-                    self._sp_id = sasp.get("sPID")
-                    self._premise_id = premise.get("premiseID")
-                    self._premise_address = sasp.get("premiseAddress", "")
-                    _LOGGER.debug(
-                        "APS: Active SASP — SA=%s SP=%s premise=%s",
-                        self._sa_id,
-                        self._sp_id,
-                        self._premise_id,
-                    )
-                    break
-            if self._sa_id:
-                break
-
-        if not self._sa_id:
-            # Fallback: take first SASP regardless of end date
-            for premise in premise_list:
-                for sasp in premise.get("sASPDetails", []):
-                    self._sa_id = sasp.get("sAID")
-                    self._sp_id = sasp.get("sPID")
-                    self._premise_id = premise.get("premiseID")
-                    self._premise_address = sasp.get("premiseAddress", "")
-                    break
-                if self._sa_id:
-                    break
+        candidates = _extract_sasp_candidates(details)
+        chosen = _choose_sasp(candidates)
+        if chosen:
+            self._sa_id = chosen["sa_id"]
+            self._sp_id = chosen["sp_id"] or None
+            self._premise_id = chosen["premise_id"] or None
+            self._premise_address = chosen["premise_address"]
+            _LOGGER.debug(
+                "APS: Selected SASP — SA=%s SP=%s premise=%s type=%s "
+                "(%d candidate(s) found)",
+                self._sa_id,
+                self._sp_id,
+                self._premise_id,
+                chosen["sa_type"],
+                len(candidates),
+            )
+        else:
+            _LOGGER.warning(
+                "APS: No service agreement (SASP) found in GetAllUserDetails; "
+                "usage fetching will fail. Please report this response "
+                "structure (keys only, no personal data) at "
+                "https://github.com/Conexo-Casa/aps-csv-ha/issues: %s",
+                _describe_structure(details),
+            )
 
         _LOGGER.debug(
             "APS: Authenticated — account=%s sa=%s sp=%s",
@@ -402,7 +526,10 @@ class APSUsageAPI:
         if not self._sa_id or not self._sp_id:
             raise APSAuthError(
                 "No active service agreement found. "
-                "Cannot fetch usage data without a valid SA/SP."
+                "Cannot fetch usage data without a valid SA/SP. "
+                "Check the Home Assistant log for an 'APS: No service "
+                "agreement (SASP) found' warning and report it at "
+                "https://github.com/Conexo-Casa/aps-csv-ha/issues"
             )
 
         end_dt = datetime.now()

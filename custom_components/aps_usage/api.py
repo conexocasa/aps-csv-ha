@@ -84,6 +84,7 @@ class APSUsageData:
     @property
     def yesterday_kwh(self) -> float | None:
         """Return yesterday's total kWh usage."""
+        # series is ordered oldest→newest; skip last entry (today, often empty)
         for item in reversed(self.series[:-1]):
             val = item.get("totalUsage")
             if val is None:

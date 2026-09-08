@@ -86,8 +86,10 @@ class APSUsageData:
         """Return yesterday's total kWh usage."""
         # series is ordered oldest→newest; skip last entry (today, often empty)
         for item in reversed(self.series[:-1]):
-            val = item.get("totalUsage") or item.get("totalDailyUsage")
-            if val:
+            val = item.get("totalUsage")
+            if val is None:
+                val = item.get("totalDailyUsage")
+            if val is not None:
                 try:
                     return float(val)
                 except (ValueError, TypeError):
@@ -163,7 +165,7 @@ class APSUsageData:
         """Yesterday's on-peak kWh."""
         for item in reversed(self.series[:-1]):
             val = item.get("onPeakUsage")
-            if val:
+            if val is not None:
                 try:
                     return float(val)
                 except (ValueError, TypeError):
@@ -175,7 +177,7 @@ class APSUsageData:
         """Yesterday's off-peak kWh."""
         for item in reversed(self.series[:-1]):
             val = item.get("offPeakUsage")
-            if val:
+            if val is not None:
                 try:
                     return float(val)
                 except (ValueError, TypeError):
